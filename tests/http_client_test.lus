@@ -14,8 +14,8 @@ local form = require("form")
 -- of the call. The last reply repeats. The stub records every call.
 local function stub(script)
     local calls = {}
-    local function fetch(url, method, headers, body)
-        local call = { url = url, method = method, headers = table.clone(headers or {}), body = body }
+    local function fetch(url, method, headers, body, options)
+        local call = { url = url, method = method, headers = table.clone(headers or {}), body = body, options = options }
         calls[#calls + 1] = call
         local reply = script[math.min(#calls, #script)]
         if type(reply) == "function" then
@@ -457,6 +457,174 @@ local function extend_test()
     assert(#trail == 3 and api.throw_http_errors == true)
 end
 
+-- Timeouts, TLS options, and streams over a stub ---------------------------------
+
+local function fetch_options_test()
+    local ca = { ca = "pem" }
+    local api, calls = client_with({ OK }, { base = "https://a.example", timeout = 5, tls = ca })
+    api:get("/")
+    assert(calls[1].options.timeout == 5 and calls[1].options.tls == ca and calls[1].options.stream == nil)
+    api:get("/", { timeout = 1, tls = { verify = false }, stream = true }):close()
+    assert(calls[2].options.timeout == 1 and calls[2].options.tls.verify == false and calls[2].options.stream == true)
+    local child = api:extend({ timeout = 9 })
+    child:get("/")
+    assert(calls[3].options.timeout == 9 and calls[3].options.tls == ca)
+
+    -- A request without these options passes no fifth argument.
+    local plain, plain_calls = client_with({ OK }, { base = "https://a.example" })
+    plain:get("/")
+    assert(plain_calls[1].options == nil)
+end
+
+local function timeout_error_test()
+    local api, calls, sleeps = client_with({ "fetch timeout while waiting for the response headers" }, { base = "https://a.example" })
+    local err = error_of(api.get, api, "/slow")
+    assert(err.code == "network" and err.timeout == true and err.attempts == 3 and #calls == 3 and #sleeps == 2)
+    assert(tostring(err):find("fetch timeout while waiting for the response headers", 1, true))
+    -- A method that is not idempotent is sent once.
+    err = error_of(api.post, api, "/slow", { json = {} })
+    assert(err.timeout == true and err.attempts == 1)
+    -- A timeout that goes away is retried like any transport error.
+    api, calls = client_with({ "fetch timeout while connecting to a.example:443", OK }, { base = "https://a.example" })
+    assert(api:get("/").attempts == 2)
+    -- Another transport error has no flag.
+    api = client_with({ "cannot connect to 127.0.0.1:1: Connection refused" }, { base = "https://a.example", retries = 0 })
+    assert(error_of(api.get, api, "/").timeout == nil)
+end
+
+local function stream_body_request_test()
+    local source = function() return nil end
+    local api, calls, sleeps = client_with({ { 503 }, OK }, { base = "https://a.example" })
+    -- A streamed body is sent once, also for a status that is retried.
+    local res = api:put("/up", { body = source, throw_http_errors = false })
+    assert(res.status == 503 and res.attempts == 1 and #calls == 1 and #sleeps == 0 and calls[1].body == source)
+    local co = coroutine.create(function() end)
+    api, calls = client_with({ { 307, "", { location = "/other" } }, OK }, { base = "https://a.example" })
+    res = api:post("/up", { body = co })
+    assert(res.status == 307 and #calls == 1 and calls[1].body == co)
+    -- A 303 drops the body, so it is followed.
+    api, calls = client_with({ { 303, "", { location = "/done" } }, OK }, { base = "https://a.example" })
+    res = api:post("/up", { body = coroutine.create(function() end) })
+    assert(res.status == 200 and calls[2].method == "GET" and calls[2].body == nil)
+end
+
+local function stream_over_stub_test()
+    -- A transport that ignores `stream` returns a vector, which is one part.
+    local api = client_with({ { 200, "whole" } }, { base = "https://a.example" })
+    local res = api:get("/", { stream = true })
+    assert(res.body == nil and res.status == 200)
+    raises(function() res:text() end, "a streamed response has no body")
+    raises(function() res:json() end, "a streamed response has no body")
+    local parts = {}
+    for part in res:chunks() do
+        parts[#parts + 1] = vector.tostring(part)
+    end
+    assert(#parts == 1 and parts[1] == "whole")
+    for _ in res:chunks() do
+        error("a finished stream has no parts")
+    end
+    local lines = {}
+    for line in api:get("/", { stream = true }):lines() do
+        lines[#lines + 1] = vector.tostring(line)
+    end
+    assert(#lines == 1 and lines[1] == "whole")
+
+    local whole = api:get("/")
+    raises(function() whole:chunks() end, "requested with `stream = true`")
+    raises(function() whole:lines() end, "requested with `stream = true`")
+    whole:close()
+    assert(whole:text() == "whole")
+end
+
+local function stream_coroutine_stub_test()
+    -- The stub returns a coroutine with the protocol of `network.fetch`.
+    local bodies = {}
+    local function body(parts, failure)
+        local co = coroutine.create(function()
+            for _, part in ipairs(parts) do
+                coroutine.yield(vector.fromstring(part))
+            end
+            if failure then
+                error(failure, 0)
+            end
+        end)
+        bodies[#bodies + 1] = co
+        return co
+    end
+    local function closed()
+        local count = 0
+        for _, co in ipairs(bodies) do
+            if coroutine.status(co) == "dead" then
+                count = count + 1
+            end
+        end
+        return count
+    end
+    local n = 0
+    local function fetch(_, _, _, _, options)
+        assert(options.stream == true)
+        n = n + 1
+        if n == 1 then
+            return 503, body({ "busy" }), {}
+        elseif n == 2 then
+            return 200, body({ "data: a\n", "\ndata", ": b\n\n", "tail" }), {}
+        elseif n == 3 then
+            return 200, body({ "one", "two" }, "fetch timeout while reading the body"), {}
+        elseif n == 4 then
+            return 404, body({ '{"error":"gone"}' }), {}
+        end
+        return 500, body({ string.rep("x", 70000) }), {}
+    end
+    local api = http_client.new({ base = "https://a.example", fetch = fetch, sleep = function() end })
+
+    -- The 503 is retried before the stream starts, and its stream is closed.
+    local res = api:get("/events", { stream = true })
+    assert(res.attempts == 2 and closed() == 1)
+    local lines = {}
+    for line in res:lines() do
+        lines[#lines + 1] = vector.tostring(line)
+    end
+    assert(table.concat(lines, "|") == "data: a||data: b||tail", table.concat(lines, "|"))
+    assert(closed() == 2)
+
+    -- A failure while the body is read raises the error object from the loop.
+    res = api:get("/slow", { stream = true })
+    local seen = {}
+    local ok, err = catch (function()
+        for part in res:chunks() do
+            seen[#seen + 1] = vector.tostring(part)
+        end
+    end)()
+    assert(not ok and http_client.is_error(err) and err.code == "network" and err.timeout == true)
+    assert(table.concat(seen) == "onetwo" and err.request.url == "https://a.example/slow")
+
+    -- A status of 400 or more reads the body for the error and closes.
+    err = error_of(api.get, api, "/gone", { stream = true })
+    assert(err.status == 404 and err.response:json().error == "gone" and closed() == 4)
+    err = error_of(api.get, api, "/big", { stream = true, retries = 0 })
+    assert(err.status == 500 and #err.response.body == 65536 and closed() == 5)
+
+    -- With throw_http_errors off, the response stays a stream.
+    n = 3
+    res = api:get("/gone", { stream = true, throw_http_errors = false })
+    assert(res.status == 404 and res.body == nil)
+    res:close()
+    res:close()
+    assert(closed() == 6)
+end
+
+local function coroutine_sleep_test()
+    -- A runtime with `coroutine.sleep` waits with it.
+    local saved = coroutine.sleep
+    local slept = {}
+    coroutine.sleep = function(seconds) slept[#slept + 1] = seconds end
+    local fetch = stub({ { 503 }, OK })
+    local api = http_client.new({ base = "https://a.example", fetch = fetch, jitter = false, retry_delay = 4 })
+    local ok, res = catch api:get("/")
+    coroutine.sleep = saved
+    assert(ok and res.attempts == 2 and #slept == 1 and slept[1] == 4)
+end
+
 -- A real round trip ------------------------------------------------------------
 
 local function round_trip_test()
@@ -533,4 +701,165 @@ local function module_functions_test()
     assert(err.code == "network" and err.request.method == "POST")
     err = error_of(http_client.request, "delete", "ftp://example.invalid/x", { retries = 0 })
     assert(err.request.method == "DELETE")
+end
+
+-- Streams over a socket ----------------------------------------------------------
+
+local function bind()
+    local ok, server = catch (function()
+        pledge("network")
+        return network.tcp.bind("127.0.0.1", 0)
+    end)()
+    if not ok then
+        skip("cannot bind a local port: " .. tostring(server))
+    end
+    local _, port = server:getsockname()
+    return server, port
+end
+
+local function stream_round_trip_test()
+    local server, port = bind()
+    local hits = 0
+    local serving = coroutine.detach(coroutine.create(network.serve), server, function(req)
+        hits = hits + 1
+        if req.path == "/count" then
+            local n = 0
+            return 200, function()
+                n = n + 1
+                if n <= 5 then
+                    return `part $(n)\n`
+                end
+            end
+        elseif req.path == "/endless" then
+            return 200, function() return string.rep("z", 1024) end
+        elseif req.path == "/events" then
+            return 200, coroutine.create(function()
+                for n = 1, 3 do
+                    coroutine.yield(`event: tick\ndata: $(n)\n\n`)
+                end
+            end), { ["Content-Type"] = "text/event-stream" }
+        elseif req.path == "/flaky" and hits == 1 then
+            return 503, "busy", { ["Retry-After"] = "0" }
+        elseif req.path == "/missing" then
+            return 404, function() return nil end, { ["X-Why"] = "gone" }
+        elseif req.path == "/denied" then
+            local sent = false
+            return 403, function()
+                if not sent then
+                    sent = true
+                    return tojson({ error = "no entry" })
+                end
+            end
+        elseif req.path == "/upload" then
+            return 200, tojson({ body = vector.tostring(req.body), coding = req.headers["transfer-encoding"] })
+        end
+        return 200, "plain"
+    end)
+    local api = http_client.new({ base = `http://127.0.0.1:$port`, retry_delay = 0 })
+
+    -- The parts of a generator body add up to the body.
+    local res = api:get("/count", { stream = true })
+    assert(res.status == 200 and res.ok and res.body == nil and res.attempts == 1)
+    local text = {}
+    for part in res:chunks() do
+        assert(type(part) == "vector" and #part > 0)
+        text[#text + 1] = vector.tostring(part)
+    end
+    assert(table.concat(text) == "part 1\npart 2\npart 3\npart 4\npart 5\n")
+    assert(res.stream == nil)
+
+    -- Leaving the loop closes the stream of a body that never ends.
+    res = api:get("/endless", { stream = true })
+    local stream = res.stream
+    local got = 0
+    for part in res:chunks() do
+        got = got + #part
+        if got >= 2048 then
+            break
+        end
+    end
+    assert(coroutine.status(stream) == "dead" and res.stream == nil)
+
+    -- The lines of a stream of server-sent events.
+    res = api:get("/events", { stream = true })
+    assert(res.headers["content-type"] == "text/event-stream")
+    local data = {}
+    for line in res:lines() do
+        if value = vector.tostring(line):match("^data: (.*)") then
+            data[#data + 1] = value
+        end
+    end
+    assert(table.concat(data, " ") == "1 2 3")
+
+    -- Leaving a loop over lines closes the stream too.
+    res = api:get("/endless", { stream = true })
+    stream = res.stream
+    local ok, err = catch (function()
+        for _ in res:lines(100) do
+        end
+    end)()
+    assert(not ok and tostring(err):find("line too long", 1, true), tostring(err))
+    assert(coroutine.status(stream) == "dead")
+
+    -- A retry happens before the stream starts.
+    hits = 0
+    res = api:get("/flaky", { stream = true })
+    assert(res.attempts == 2)
+    local plain = {}
+    for part in res:chunks() do
+        plain[#plain + 1] = vector.tostring(part)
+    end
+    assert(table.concat(plain) == "plain")
+
+    -- A status of 400 or more raises with the start of the body.
+    err = error_of(api.get, api, "/denied", { stream = true })
+    assert(err.status == 403 and err.response:json().error == "no entry")
+    err = error_of(api.get, api, "/missing", { stream = true })
+    assert(err.status == 404 and err.response:text() == "" and err.response.headers["x-why"] == "gone")
+
+    -- A coroutine and a function each produce a request body in chunks.
+    local echo = api:post("/upload", { body = coroutine.create(function()
+        coroutine.yield("up")
+        coroutine.yield(vector.fromstring("load"))
+    end) }):json()
+    assert(echo.body == "upload" and echo.coding == "chunked")
+    local n = 0
+    echo = api:put("/upload", { body = function()
+        n = n + 1
+        if n <= 3 then
+            return tostring(n)
+        end
+    end }):json()
+    assert(echo.body == "123")
+
+    -- Inside a detached coroutine every step suspends, so the server of the
+    -- same state answers in the meantime.
+    local job = coroutine.detach(coroutine.create(function()
+        local total = 0
+        for line in api:get("/count", { stream = true }):lines() do
+            total = total + #line
+        end
+        return total, api:get("/plain"):text()
+    end))
+    local resumed, total, body = coroutine.resume(job)
+    assert(resumed and total == 30 and body == "plain", tostring(total))
+
+    coroutine.close(serving)
+    server:close()
+end
+
+local function timeout_round_trip_test()
+    -- The server accepts no connection, so no response headers arrive.
+    local server, port = bind()
+    local api = http_client.new({ base = `http://127.0.0.1:$port`, timeout = 0.05, retries = 1, retry_delay = 0 })
+    local start = time.monotonic()
+    local err = error_of(api.get, api, "/never")
+    local elapsed = (time.monotonic() - start):seconds()
+    assert(err.code == "network" and err.timeout == true and err.attempts == 2, tostring(err))
+    assert(tostring(err.cause):find("fetch timeout while waiting for the response headers", 1, true), tostring(err.cause))
+    assert(elapsed >= 0.1 and elapsed < 5, elapsed)
+    -- The timeout of a request replaces that of the client.
+    err = error_of(api.post, api, "/never", { timeout = 0.01, body = "x" })
+    assert(err.timeout == true and err.attempts == 1)
+    server:close()
 end

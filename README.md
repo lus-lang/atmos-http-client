@@ -1,6 +1,6 @@
 # http_client
 
-`http_client` sends HTTP requests with `network.fetch` and adds a base URL, default headers, query tables, retries with exponential backoff, redirects, and hooks. A request body can be JSON, URL-encoded, or multipart. A response with a status of 400 or more raises an error object that includes the response.
+`http_client` sends HTTP requests with `network.fetch` and adds a base URL, default headers, query tables, retries with exponential backoff, redirects, and hooks. A request body can be JSON, URL-encoded, multipart, or a stream that a coroutine produces. A response can be streamed, so that its body arrives in parts or line by line. A response with a status of 400 or more raises an error object that includes the response.
 
 The following example calls the user API of a service with a bearer token and handles a missing user.
 
@@ -23,6 +23,11 @@ api:post("/avatars", { multipart = { user = "42", image = { filename = "avatar.p
 local ok, err = catch api:get("/users/0")
 if not ok and http_client.is_error(err) and err.status == 404 then
     print(err.response:json().error)
+end
+
+-- A streamed response gives its lines as the server sends them.
+for line in api:get("/events", { stream = true, timeout = 60 }):lines() do
+    print(vector.tostring(line))
 end
 ```
 

@@ -4,7 +4,7 @@
 
 ## Scope
 
-`http_client` sends HTTP requests with `network.fetch` and adds a base URL, default headers, query tables, retries with exponential backoff, redirects, and hooks. A request body can be JSON, URL-encoded, or multipart. A response with a status of 400 or more raises an error object that includes the response. The public API is every function that `http_client.lus` returns in its module table. A change to that API needs a new entry in `CHANGELOG.md` and a version change in the header.
+`http_client` sends HTTP requests with `network.fetch` and adds a base URL, default headers, query tables, retries with exponential backoff, redirects, and hooks. A request body can be JSON, URL-encoded, multipart, or a stream that a coroutine produces. A response can be streamed, so that its body arrives in parts or line by line. A response with a status of 400 or more raises an error object that includes the response. The public API is every function that `http_client.lus` returns in its module table. A change to that API needs a new entry in `CHANGELOG.md` and a version change in the header.
 
 ## Layout
 

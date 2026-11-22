@@ -6,8 +6,9 @@
 --- transit or that received a status such as 503, with exponential backoff
 --- between the attempts. It also follows redirects. A response is a table
 --- with `status`, `headers`, `body` as a vector, `ok`, and the methods
---- `text` and `json`. A status of 400 or more raises an error object that
---- includes the response.
+--- `text` and `json`. A streamed response gives its body in parts as they
+--- arrive, with the methods `chunks` and `lines`. A status of 400 or more
+--- raises an error object that includes the response.
 ---
 --- ```lus nocheck
 --- local http_client = require("https://atmosp.here/2.0/http_client.lus")
@@ -44,8 +45,10 @@ end
 --- The code `"http"` means that the response has a status of 400 or more.
 --- Such an error also has the `status` and the `response`, whose `json`
 --- and `text` methods read the body. The code `"network"` means that the
---- request got no response. Such an error has the transport error in
---- `cause`.
+--- request got no response, or that the body of a streamed response
+--- failed while it was read. Such an error has the transport error in
+--- `cause`. Its `timeout` is true when a step of the request ran out of
+--- time.
 --- @param value any The value to test.
 --- @return boolean
 function M.is_error(value)
@@ -60,19 +63,185 @@ Response.__index = Response
 --- Returns the body of the response as a string.
 ---
 --- The body is decoded as UTF-8. A byte sequence that is not UTF-8 becomes
---- U+FFFD.
+--- U+FFFD. A streamed response has no body, so the call raises an error.
 --- @return string
 function Response:text()
     local body = self.body
+    if body == nil then
+        error("http_client: a streamed response has no body, so read it with `chunks` or `lines`", 2)
+    end
     return vector.tostring(body, 0, #body, "lossy")
 end
 
 --- Decodes the body of the response as JSON.
 ---
---- A body that is not JSON raises the error of `fromjson`.
+--- A body that is not JSON raises the error of `fromjson`. A streamed
+--- response has no body, so the call raises an error.
 --- @return any
 function Response:json()
+    if self.body == nil then
+        error("http_client: a streamed response has no body, so read it with `chunks` or `lines`", 2)
+    end
     return fromjson(self:text())
+end
+
+local function is_timeout(cause)
+    return type(cause) == "string" and cause:find("fetch timeout", 1, true) ~= nil
+end
+
+local Closer = {}
+Closer.__close = function(closer)
+    closer.response:close()
+end
+
+-- Raises the error object of a stream that failed while it was read.
+local function fail_stream(response, cause)
+    response:close()
+    error(setmetatable({
+        code = "network",
+        message = `$(response.method) $(response.url): $(tostring(cause))`,
+        cause = cause,
+        timeout = is_timeout(cause) or nil,
+        request = response.request,
+        attempts = response.attempts,
+    }, ClientError), 0)
+end
+
+-- Returns the next part of the stream of a response, or nil at its end.
+local function next_part(response)
+    local stream = response.stream
+    if stream == nil then
+        return nil
+    end
+    if type(stream) ~= "thread" then
+        -- A transport that ignores the `stream` option returned a whole body.
+        response.stream = nil
+        if type(stream) == "string" then
+            stream = vector.fromstring(stream)
+        end
+        return #stream > 0 and stream or nil
+    end
+    while true do
+        local ok, part = coroutine.resume(stream)
+        if not ok then
+            fail_stream(response, part)
+        end
+        if part == nil then
+            if coroutine.status(stream) == "dead" then
+                response.stream = nil
+                return nil
+            end
+        elseif #part > 0 then
+            return type(part) == "string" and vector.fromstring(part) or part
+        end
+    end
+end
+
+--- Returns an iterator over the parts of the body of a streamed response.
+---
+--- Each step of a `for` loop waits for the next part and gets it as a
+--- vector that is not empty. The loop ends at the end of the body. Leaving
+--- the loop early, with `break` or with an error, closes the stream and
+--- its connection. Inside a detached coroutine each step suspends the
+--- coroutine while it waits.
+---
+--- A failure while the body is read, such as a body that ends early or a
+--- part that takes longer than the `timeout`, closes the stream and raises
+--- an error object with the code `"network"`. A response that was not
+--- streamed raises an error.
+--- @return function The iterator.
+function Response:chunks()
+    if not self.streamed then
+        error("http_client: `chunks` reads a response that was requested with `stream = true`", 2)
+    end
+    return next_part, self, nil, setmetatable({ response = self }, Closer)
+end
+
+--- Returns an iterator over the lines of the body of a streamed response.
+---
+--- Each step of a `for` loop gets one line as a vector without its line
+--- end, as `network.lines` reads it, so the events of a `text/event-stream`
+--- response arrive line by line as the server sends them. `max_bytes`
+--- limits a line and defaults to 1 MiB. Leaving the loop early closes the
+--- stream and its connection.
+---
+--- A failure while the body is read raises the error object that `chunks`
+--- raises. A longer line raises `"line too long"`. A response that was not
+--- streamed raises an error.
+--- @param max_bytes integer? The longest line in bytes.
+--- @return function The iterator.
+function Response:lines(max_bytes)
+    if not self.streamed then
+        error("http_client: `lines` reads a response that was requested with `stream = true`", 2)
+    end
+    local response = self
+    local failure
+    -- `network.lines` reads a coroutine, so this one hands it the parts.
+    local parts = coroutine.create(function()
+        while true do
+            local ok, part = catch next_part(response)
+            if not ok then
+                failure = part
+                error(part, 0)
+            end
+            if part == nil then
+                return
+            end
+            coroutine.yield(part)
+        end
+    end)
+    local step, state = network.lines(parts, max_bytes)
+    return function()
+        local ok, line = catch step(state)
+        if not ok then
+            response:close()
+            -- The error object of the stream comes out as it was raised.
+            error(failure or line, 0)
+        end
+        return line
+    end, nil, nil, setmetatable({ response = self }, Closer)
+end
+
+--- Closes the stream of a streamed response and its connection.
+---
+--- The iterators of `chunks` and `lines` close the stream when their loop
+--- ends, so this method is for a streamed response that no loop reads.
+--- Closing a response again, or one that was not streamed, does nothing.
+function Response:close()
+    local stream = self.stream
+    self.stream = nil
+    if type(stream) == "thread" then
+        coroutine.close(stream)
+    end
+end
+
+-- Reads at most `cap` bytes of the stream of a response into a vector and
+-- closes the stream.
+local function read_capped(response, cap)
+    local pieces, size = {}, 0
+    local ok = catch (function()
+        while size < cap do
+            local part = next_part(response)
+            if part == nil then
+                break
+            end
+            if size + #part > cap then
+                part = part[1, cap - size]
+            end
+            pieces[#pieces + 1] = part
+            size = size + #part
+        end
+    end)()
+    response:close()
+    local body = vector.create(size)
+    local offset = 0
+    if ok then
+        for _, piece in ipairs(pieces) do
+            vector.copy(body, offset, piece)
+            offset = offset + #piece
+        end
+    end
+    return ok and body or vector.create(0)
 end
 
 -- URLs ------------------------------------------------------------------------
@@ -160,9 +329,13 @@ local function retry_after(value, now)
     return wait > 0 and wait or 0
 end
 
--- The standard library has no sleep, so the default waits on the monotonic
--- clock. A program with a scheduler passes its own `sleep`.
+-- Waits with `coroutine.sleep` in a runtime that has it, which suspends a
+-- detached coroutine. Any other runtime waits on the monotonic clock.
 local function default_sleep(seconds)
+    if suspend = coroutine.sleep then
+        suspend(seconds)
+        return
+    end
     local start = time.monotonic()
     while (time.monotonic() - start):seconds() < seconds do
     end
@@ -179,6 +352,7 @@ end
 local RETRY_METHODS = { "GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE" }
 local RETRY_STATUSES = { 408, 429, 500, 502, 503, 504 }
 local REDIRECTS = { [301] = true, [302] = true, [303] = true, [307] = true, [308] = true }
+local ERROR_BODY_CAP = 65536
 
 -- Clients ---------------------------------------------------------------------
 
@@ -264,6 +438,11 @@ end
 ---   500, 502, 503, and 504.
 --- - `max_redirects`: how many redirects a request follows, 5 by default.
 ---   With 0, a 3xx response is returned as it is.
+--- - `timeout`: the seconds that each step of a request may take, as the
+---   `timeout` option of `network.fetch` counts them. The default is that
+---   of `network.fetch`.
+--- - `tls`: a table of client TLS options for `https` URLs, as
+---   `network.fetch` takes them, such as `{ ca = pem }`.
 --- - `before_request`: a function or a list of functions `hook(request)`.
 ---   Each runs once before the request is sent and may change the fields
 ---   `method`, `url`, `headers`, and `body` of the request table.
@@ -271,10 +450,13 @@ end
 ---   `hook(response, request)`. Each runs on the final response, before the
 ---   status is checked. A hook that returns a value replaces the response.
 --- - `fetch`: the transport, a function with the signature and the results
----   of `network.fetch`, which is the default. Tests pass a stub here.
+---   of `network.fetch`, which is the default. Its fifth argument is the
+---   table of the `stream`, `timeout`, and `tls` options of the request, or
+---   nil when the request sets none. Tests pass a stub here.
 --- - `sleep`: a function `sleep(seconds)` that waits between retries. The
----   default waits on the monotonic clock and keeps the processor busy, so
----   a program with a scheduler passes a function that suspends.
+---   default calls `coroutine.sleep` in a runtime that has it. In any other
+---   runtime it waits on the monotonic clock and keeps the processor busy,
+---   so a program with a scheduler passes a function that suspends.
 --- @param options table? The options.
 --- @return table The client.
 function M.new(options)
@@ -291,6 +473,8 @@ function M.new(options)
     self.retry_methods = options.retry_methods or RETRY_METHODS
     self.retry_statuses = options.retry_statuses or RETRY_STATUSES
     self.max_redirects = options.max_redirects or 5
+    self.timeout = options.timeout
+    self.tls = options.tls
     self.before_request = to_list(options.before_request)
     self.after_response = to_list(options.after_response)
     self.fetch = options.fetch or network.fetch
@@ -313,7 +497,7 @@ function Client:extend(options)
     local merged = {}
     for _, name in ipairs({
         "base", "throw_http_errors", "retries", "retry_delay", "max_retry_delay", "jitter",
-        "retry_methods", "retry_statuses", "max_redirects", "fetch", "sleep", "now",
+        "retry_methods", "retry_statuses", "max_redirects", "timeout", "tls", "fetch", "sleep", "now",
     }) do
         merged[name] = option(options, self, name)
     end
@@ -354,29 +538,46 @@ end
 ---   `application/x-www-form-urlencoded`.
 --- - `multipart`: a table of fields and files that is sent as
 ---   `multipart/form-data`, in the format of `form.encode_multipart`.
---- - `body`: a string or a vector that is sent as it is.
---- - `retries`, `throw_http_errors`, `max_redirects`: values for this
----   request in place of those of the client.
+--- - `body`: a string or a vector that is sent as it is. A coroutine or a
+---   function is a streamed body, which `network.fetch` sends in chunks as
+---   the coroutine yields them or as the function returns them.
+--- - `stream`: `true` to receive the body in parts as they arrive.
+--- - `retries`, `throw_http_errors`, `max_redirects`, `timeout`, `tls`:
+---   values for this request in place of those of the client.
 ---
 --- The response is a table with `status`, `headers` (lowercase names),
 --- `body` (a vector), `ok` (true for a 2xx status), `url` (the URL that
 --- answered, after redirects), `method`, and `attempts` (how many times
 --- the request was sent). Its methods are `text()` and `json()`.
 ---
+--- With `stream`, the call returns as soon as the status and the headers
+--- have arrived. The response then has no `body`. Its method `chunks()`
+--- iterates over the parts of the body as vectors. Its method `lines()`
+--- iterates over its lines. A loop that ends, early or at the end of the
+--- body, closes the stream. The method `close()` closes a stream that no
+--- loop reads.
+---
 --- A request is sent again when its method is one of `retry_methods` and
 --- either the transport raised an error or the status is one of
---- `retry_statuses`. The wait doubles with each retry. A `Retry-After`
---- header, in seconds or as a date, sets the wait in its place.
+--- `retry_statuses`. A step that ran out of time is such a transport
+--- error. The wait doubles with each retry. A `Retry-After` header, in
+--- seconds or as a date, sets the wait in its place. A streamed response
+--- is retried only until its headers have arrived, so a failure while its
+--- body is read raises its error from the loop. A streamed request body
+--- can be produced only once, so such a request is sent once.
 ---
 --- A redirect with the status 301, 302, or 303 is followed with `GET` and
 --- without the body, unless the method is `GET` or `HEAD`. A 307 or a 308
---- keeps the method and the body. A redirect to another origin drops the
---- `authorization` and `cookie` headers.
+--- keeps the method and the body. Such a redirect of a request with a
+--- streamed body is returned as it is. A redirect to another origin drops
+--- the `authorization` and `cookie` headers.
 ---
 --- A status of 400 or more raises an error object with the code `"http"`
---- unless `throw_http_errors` is false. A transport error that remains after
---- the last retry raises an error object with the code `"network"`. See
---- `http_client.is_error`.
+--- unless `throw_http_errors` is false. The response of such an error
+--- always has a `body`. For a streamed request it is the first 64 KiB of
+--- the body, which is read before the stream is closed. A transport error
+--- that remains after the last retry raises an error object with the code
+--- `"network"`. See `http_client.is_error`.
 --- @param method string The method, in any case.
 --- @param url string The URL.
 --- @param options table? The options.
@@ -413,18 +614,32 @@ function Client:request(method, url, options)
     local fetch, sleep from self
     local retries = option(options, self, "retries")
     local redirects = option(options, self, "max_redirects")
+    local streamed = options.stream == true
+    local timeout = option(options, self, "timeout")
+    local tls = option(options, self, "tls")
+    local fetch_options = nil
+    if streamed or timeout ~= nil or tls ~= nil then
+        fetch_options = { stream = streamed or nil, timeout = timeout, tls = tls }
+    end
+    -- A coroutine or a function produces its body once.
+    local body_kind = type(request.body)
+    local once = body_kind == "thread" or body_kind == "function"
+    if once then
+        retries = 0
+    end
     local max_delay = self.max_retry_delay
     local attempts = 0
     local status, response_body, response_headers
     while true do
         attempts = attempts + 1
         local ok
-        ok, status, response_body, response_headers = catch fetch(request.url, request.method, request.headers, request.body)
+        ok, status, response_body, response_headers = catch fetch(request.url, request.method, request.headers,
+            request.body, fetch_options)
         local may_retry = attempts <= retries and self.method_set[request.method]
         if not ok then
             if not may_retry then
                 fail("network", `$(request.method) $(request.url): $(tostring(status))`,
-                    { cause = status, request = request, attempts = attempts })
+                    { cause = status, timeout = is_timeout(status) or nil, request = request, attempts = attempts })
             end
             sleep(backoff(self, attempts))
             continue
@@ -432,14 +647,19 @@ function Client:request(method, url, options)
         response_headers = response_headers or {}
         if may_retry and self.status_set[status] then
             local asked = retry_after(response_headers["retry-after"], self.now)
-            if asked == nil then
-                sleep(backoff(self, attempts))
-                continue
-            elseif asked <= max_delay then
-                sleep(asked)
+            if asked == nil or asked <= max_delay then
+                -- The stream of a reply that is not kept is closed.
+                if type(response_body) == "thread" then
+                    coroutine.close(response_body)
+                end
+                sleep(asked or backoff(self, attempts))
                 continue
             end
-        elseif REDIRECTS[status] and redirects > 0 and response_headers.location then
+        elseif REDIRECTS[status] and redirects > 0 and response_headers.location
+            and not (once and (status == 307 or status == 308)) then
+            if type(response_body) == "thread" then
+                coroutine.close(response_body)
+            end
             redirects = redirects - 1
             local target = resolve(request.url, response_headers.location)
             if origin_of(target) ~= origin_of(request.url) then
@@ -462,12 +682,18 @@ function Client:request(method, url, options)
     local response = setmetatable({
         status = status,
         headers = response_headers,
-        body = response_body or vector.create(0),
         ok = status >= 200 and status < 300,
         url = request.url,
         method = request.method,
         attempts = attempts,
     }, Response)
+    if streamed then
+        response.streamed = true
+        response.stream = response_body
+        response.request = request
+    else
+        response.body = response_body or vector.create(0)
+    end
     for _, hook in ipairs(self.after_response) do
         local replaced = hook(response, request)
         if replaced ~= nil then
@@ -475,6 +701,10 @@ function Client:request(method, url, options)
         end
     end
     if response.status >= 400 and option(options, self, "throw_http_errors") then
+        if response.streamed then
+            response.body = read_capped(response, ERROR_BODY_CAP)
+            response.streamed = nil
+        end
         fail("http", `$(request.method) $(request.url): status $(response.status)`,
             { status = response.status, response = response, request = request, attempts = attempts })
     end
