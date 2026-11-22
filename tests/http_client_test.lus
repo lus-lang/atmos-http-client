@@ -617,7 +617,10 @@ local function coroutine_sleep_test()
     -- A runtime with `coroutine.sleep` waits with it.
     local saved = coroutine.sleep
     local slept = {}
-    coroutine.sleep = function(seconds) slept[#slept + 1] = seconds end
+    coroutine.sleep = function(seconds)
+        slept[#slept + 1] = seconds
+        return coroutine.create(function() end)
+    end
     local fetch = stub({ { 503 }, OK })
     local api = http_client.new({ base = "https://a.example", fetch = fetch, jitter = false, retry_delay = 4 })
     local ok, res = catch api:get("/")

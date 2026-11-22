@@ -332,8 +332,8 @@ end
 -- Waits with `coroutine.sleep` in a runtime that has it, which suspends a
 -- detached coroutine. Any other runtime waits on the monotonic clock.
 local function default_sleep(seconds)
-    if suspend = coroutine.sleep then
-        suspend(seconds)
+    if sleep = coroutine.sleep then
+        coroutine.resume(sleep(seconds))
         return
     end
     local start = time.monotonic()
