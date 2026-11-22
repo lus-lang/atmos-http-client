@@ -1,0 +1,537 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. PACKAGES .. "/*")
+package.path = ROOT .. "/?.lus;"
+    .. PACKAGES .. "/form/?.lus;" .. PACKAGES .. "/atmos-form/?.lus;" .. package.path
+-- The package requires form by its atmosphere URL. The tests load the
+-- checkout next to this one in its place.
+package.preload["https://atmosp.here/2.0/form.lus"] = function() return require("form") end
+
+local http_client = require("http_client")
+local form = require("form")
+
+-- Builds a transport stub. `script` is a list of replies, each a table
+-- `{ status, body, headers }`, a string that the stub raises, or a function
+-- of the call. The last reply repeats. The stub records every call.
+local function stub(script)
+    local calls = {}
+    local function fetch(url, method, headers, body)
+        local call = { url = url, method = method, headers = table.clone(headers or {}), body = body }
+        calls[#calls + 1] = call
+        local reply = script[math.min(#calls, #script)]
+        if type(reply) == "function" then
+            reply = reply(call)
+        end
+        if type(reply) == "string" then
+            error(reply, 0)
+        end
+        local out = reply[2] or ""
+        if type(out) == "table" then
+            out = tojson(out)
+        end
+        return reply[1], vector.fromstring(out), reply[3] or {}
+    end
+    return fetch, calls
+end
+
+-- Returns a client over a stub, the recorded calls, and the recorded sleeps.
+local function client_with(script, options)
+    local fetch, calls = stub(script)
+    local sleeps = {}
+    options = options or {}
+    options.fetch = fetch
+    options.sleep = options.sleep or function(seconds) sleeps[#sleeps + 1] = seconds end
+    if options.jitter == nil then
+        options.jitter = false
+    end
+    return http_client.new(options), calls, sleeps
+end
+
+local function error_of(fn, ...)
+    local ok, err = catch fn(...)
+    assert(not ok, "expected an error")
+    assert(http_client.is_error(err), tostring(err))
+    return err
+end
+
+local OK = { 200, { ok = true }, { ["content-type"] = "application/json" } }
+
+-- Requests ---------------------------------------------------------------------
+
+local function get_test()
+    local api, calls = client_with({ OK }, { base = "https://api.example.com" })
+    local res = api:get("/users/42")
+    assert(res.status == 200 and res.ok == true)
+    assert(type(res.body) == "vector")
+    assert(res:text() == '{"ok":true}')
+    assert(res:json().ok == true)
+    assert(res.headers["content-type"] == "application/json")
+    assert(res.url == "https://api.example.com/users/42" and res.method == "GET" and res.attempts == 1)
+    assert(#calls == 1 and calls[1].method == "GET" and calls[1].body == nil)
+end
+
+local function base_url_test()
+    local cases = {
+        { "https://a.example", "/x", "https://a.example/x" },
+        { "https://a.example/", "/x", "https://a.example/x" },
+        { "https://a.example/v1", "x", "https://a.example/v1/x" },
+        { "https://a.example/v1/", "x/y", "https://a.example/v1/x/y" },
+        { "https://a.example/v1", "", "https://a.example/v1" },
+        { "https://a.example/v1", "?page=2", "https://a.example/v1?page=2" },
+        { "https://a.example/v1", "https://b.example/z", "https://b.example/z" },
+        { nil, "http://c.example/", "http://c.example/" },
+    }
+    for _, case in ipairs(cases) do
+        local api, calls = client_with({ OK }, { base = case[1] })
+        api:get(case[2])
+        assert(calls[1].url == case[3], calls[1].url)
+    end
+    local api = client_with({ OK })
+    raises(function() api:get("/relative") end, "needs a base")
+end
+
+local function query_test()
+    local api, calls = client_with({ OK }, { base = "https://a.example", query = { key = "k 1" } })
+    api:get("/s", { query = { q = "a&b", tags = { "x", "y" }, filter = { age = 3 } } })
+    assert(calls[1].url == "https://a.example/s?key=k%201&filter[age]=3&q=a%26b&tags[]=x&tags[]=y", calls[1].url)
+    api:get("/s?fixed=1", { query = {} })
+    assert(calls[2].url == "https://a.example/s?fixed=1&key=k%201")
+end
+
+local function headers_test()
+    local api, calls = client_with({ OK }, {
+        base = "https://a.example",
+        headers = { Authorization = "Bearer t", ["X-Trace"] = "1", Accept = "application/json" },
+    })
+    api:get("/", { headers = { ["x-trace"] = "2", accept = false, ["X-New"] = "n" } })
+    local h = calls[1].headers
+    assert(h.authorization == "Bearer t")
+    assert(h["x-trace"] == "2")
+    assert(h.accept == nil)
+    assert(h["x-new"] == "n")
+    -- The headers of one request leave the client as it was.
+    api:get("/")
+    assert(calls[2].headers["x-trace"] == "1" and calls[2].headers.accept == "application/json")
+end
+
+local function json_body_test()
+    local api, calls = client_with({ { 201, { id = 7 } } }, { base = "https://a.example" })
+    local res = api:post("/users", { json = { name = "Ada", tags = { "a" } } })
+    assert(res.status == 201 and res:json().id == 7)
+    assert(calls[1].method == "POST")
+    assert(calls[1].headers["content-type"] == "application/json")
+    local sent = fromjson(calls[1].body)
+    assert(sent.name == "Ada" and sent.tags[1] == "a")
+    api:put("/flag", { json = false })
+    assert(calls[2].body == "false")
+end
+
+local function form_body_test()
+    local api, calls = client_with({ OK }, { base = "https://a.example" })
+    api:post("/login", { form = { user = { name = "Ada L" }, roles = { "a", "b" } } })
+    assert(calls[1].headers["content-type"] == "application/x-www-form-urlencoded")
+    assert(calls[1].body == "roles[]=a&roles[]=b&user[name]=Ada%20L", calls[1].body)
+end
+
+local function multipart_body_test()
+    local api, calls = client_with({ OK }, { base = "https://a.example" })
+    local data = vector.create(3)
+    vector.set(data, 0, 255)
+    api:post("/upload", { multipart = { title = "x", file = { filename = "a.bin", data = data } } })
+    local ctype = calls[1].headers["content-type"]
+    assert(ctype:find("^multipart/form%-data; boundary="))
+    assert(type(calls[1].body) == "vector")
+    local parts = form.multipart(calls[1].body, ctype)
+    assert(parts.fields.title == "x")
+    assert(parts.files[1].filename == "a.bin" and vector.get(parts.files[1].data, 0) == 255)
+end
+
+local function raw_body_test()
+    local api, calls = client_with({ OK }, { base = "https://a.example" })
+    local v = vector.fromstring("bytes")
+    api:patch("/raw", { body = v, headers = { ["Content-Type"] = "application/octet-stream" } })
+    assert(calls[1].method == "PATCH" and calls[1].body == v)
+    assert(calls[1].headers["content-type"] == "application/octet-stream")
+    api:post("/text", { body = "plain" })
+    assert(calls[2].body == "plain" and calls[2].headers["content-type"] == nil)
+    -- A content type of the request wins over the one that an encoder sets.
+    api:post("/j", { json = {}, headers = { ["content-type"] = "application/vnd.api+json" } })
+    assert(calls[3].headers["content-type"] == "application/vnd.api+json")
+end
+
+local function methods_test()
+    local api, calls = client_with({ { 204 } }, { base = "https://a.example" })
+    api:get("/")
+    api:head("/")
+    api:post("/")
+    api:put("/")
+    api:patch("/")
+    api:delete("/")
+    api:request("options", "/")
+    local seen = {}
+    for i, call in ipairs(calls) do
+        seen[i] = call.method
+    end
+    assert(table.concat(seen, " ") == "GET HEAD POST PUT PATCH DELETE OPTIONS")
+end
+
+-- Responses and errors ---------------------------------------------------------
+
+local function response_text_test()
+    local raw = vector.fromstring("a_b")
+    vector.set(raw, 1, 255)
+    local api = http_client.new({ fetch = function() return 200, raw, {} end })
+    local res = api:get("http://x.example/")
+    assert(res.body == raw)
+    assert(res:text() == "a\u{FFFD}b")
+    api = client_with({ { 200, "not json" } })
+    local ok = catch api:get("http://x.example/"):json()
+    assert(not ok)
+    api = http_client.new({ fetch = function() return 204 end })
+    res = api:get("http://x.example/")
+    assert(res.status == 204 and #res.body == 0 and res:text() == "" and next(res.headers) == nil)
+end
+
+local function http_error_test()
+    local api, calls = client_with({ { 404, { error = "no such user" }, { ["x-id"] = "9" } } }, { base = "https://a.example" })
+    local err = error_of(api.get, api, "/users/0")
+    assert(err.code == "http" and err.status == 404)
+    assert(err.response.status == 404 and err.response.ok == false)
+    assert(err.response:json().error == "no such user")
+    assert(err.response.headers["x-id"] == "9")
+    assert(err.request.url == "https://a.example/users/0")
+    assert(tostring(err) == "http_client: GET https://a.example/users/0: status 404")
+    assert(#calls == 1)
+    assert(not http_client.is_error("text") and not http_client.is_error({}))
+end
+
+local function no_throw_test()
+    local api = client_with({ { 500, "boom" } }, { base = "https://a.example", throw_http_errors = false, retries = 0 })
+    local res = api:get("/")
+    assert(res.status == 500 and res.ok == false and res:text() == "boom")
+    -- One request may ask for the other behavior.
+    assert(error_of(api.get, api, "/", { throw_http_errors = true }).status == 500)
+    api = client_with({ { 404 } }, { base = "https://a.example" })
+    assert(api:get("/", { throw_http_errors = false }).status == 404)
+end
+
+-- Retries ----------------------------------------------------------------------
+
+local function retry_status_test()
+    local api, calls, sleeps = client_with({ { 503 }, { 500 }, OK }, { base = "https://a.example", retries = 3, retry_delay = 0.5 })
+    local res = api:get("/")
+    assert(res.status == 200 and res.attempts == 3)
+    assert(#calls == 3)
+    assert(#sleeps == 2 and sleeps[1] == 0.5 and sleeps[2] == 1.0)
+end
+
+local function retry_statuses_test()
+    for _, status in ipairs({ 408, 429, 500, 502, 503, 504 }) do
+        local api, calls = client_with({ { status }, OK }, { base = "https://a.example" })
+        assert(api:get("/").status == 200 and #calls == 2, status)
+    end
+    for _, status in ipairs({ 400, 401, 404, 409, 501 }) do
+        local api, calls = client_with({ { status }, OK }, { base = "https://a.example" })
+        assert(error_of(api.get, api, "/").status == status)
+        assert(#calls == 1, status)
+    end
+    local api, calls = client_with({ { 418 }, OK }, { base = "https://a.example", retry_statuses = { 418 } })
+    assert(api:get("/").ok and #calls == 2)
+end
+
+local function retries_exhausted_test()
+    local api, calls, sleeps = client_with({ { 503, "down" } }, { base = "https://a.example", retries = 2 })
+    local err = error_of(api.get, api, "/")
+    assert(err.status == 503 and err.attempts == 3 and err.response:text() == "down")
+    assert(#calls == 3 and #sleeps == 2)
+    api, calls = client_with({ { 503 } }, { base = "https://a.example" })
+    error_of(api.get, api, "/", { retries = 0 })
+    assert(#calls == 1)
+end
+
+local function retry_methods_test()
+    local api, calls = client_with({ { 503 }, OK }, { base = "https://a.example" })
+    assert(error_of(api.post, api, "/", { json = {} }).status == 503)
+    assert(#calls == 1)
+    api, calls = client_with({ { 503 }, OK }, { base = "https://a.example" })
+    assert(error_of(api.patch, api, "/").status == 503 and #calls == 1)
+    for _, method in ipairs({ "GET", "HEAD", "PUT", "DELETE", "OPTIONS" }) do
+        api, calls = client_with({ { 503 }, OK }, { base = "https://a.example" })
+        assert(api:request(method, "/").ok and #calls == 2, method)
+    end
+    api, calls = client_with({ { 503 }, OK }, { base = "https://a.example", retry_methods = { "post" } })
+    assert(api:post("/").ok and #calls == 2)
+end
+
+local function retry_network_error_test()
+    local api, calls, sleeps = client_with({ "cannot connect to 127.0.0.1:1: Connection refused", OK }, { base = "https://a.example" })
+    local res = api:get("/")
+    assert(res.ok and res.attempts == 2 and #calls == 2 and #sleeps == 1)
+
+    api, calls = client_with({ "connection reset" }, { base = "https://a.example", retries = 2 })
+    local err = error_of(api.get, api, "/x")
+    assert(err.code == "network" and err.cause == "connection reset" and err.attempts == 3)
+    assert(err.status == nil and err.response == nil)
+    assert(tostring(err) == "http_client: GET https://a.example/x: connection reset")
+    assert(#calls == 3)
+
+    -- A method that is not idempotent is sent once.
+    api, calls = client_with({ "connection reset", OK }, { base = "https://a.example" })
+    err = error_of(api.post, api, "/x", { json = { a = 1 } })
+    assert(err.code == "network" and err.attempts == 1 and #calls == 1)
+end
+
+local function backoff_test()
+    local api, _, sleeps = client_with({ { 503 } }, {
+        base = "https://a.example", retries = 6, retry_delay = 1, max_retry_delay = 10, throw_http_errors = false,
+    })
+    api:get("/")
+    local expected = { 1, 2, 4, 8, 10, 10 }
+    assert(#sleeps == #expected)
+    for i, seconds in ipairs(expected) do
+        assert(sleeps[i] == seconds, i)
+    end
+end
+
+local function jitter_test()
+    local seen = {}
+    for _ = 1, 20 do
+        local api, _, sleeps = client_with({ { 503 }, OK }, { base = "https://a.example", jitter = true, retry_delay = 2 })
+        api:get("/")
+        assert(sleeps[1] >= 1 and sleeps[1] <= 2, sleeps[1])
+        seen[sleeps[1]] = true
+    end
+    local distinct = 0
+    for _ in pairs(seen) do
+        distinct = distinct + 1
+    end
+    assert(distinct > 1)
+end
+
+local function default_sleep_test()
+    local fetch = stub({ { 503 }, OK })
+    local api = http_client.new({ base = "https://a.example", fetch = fetch, jitter = false, retry_delay = 0.02 })
+    local start = time.monotonic()
+    assert(api:get("/").attempts == 2)
+    local elapsed = (time.monotonic() - start):seconds()
+    assert(elapsed >= 0.02 and elapsed < 2, elapsed)
+end
+
+local function retry_after_seconds_test()
+    local api, calls, sleeps = client_with({ { 429, "", { ["retry-after"] = "7" } }, OK }, { base = "https://a.example" })
+    assert(api:get("/").ok)
+    assert(#calls == 2 and sleeps[1] == 7)
+    -- A wait over the limit ends the retries.
+    api, calls, sleeps = client_with({ { 429, "", { ["retry-after"] = "120" } }, OK }, { base = "https://a.example" })
+    assert(error_of(api.get, api, "/").status == 429)
+    assert(#calls == 1 and #sleeps == 0)
+    -- A value that is neither a count nor a date falls back to the backoff.
+    api, calls, sleeps = client_with({ { 503, "", { ["retry-after"] = "soon" } }, OK }, { base = "https://a.example", retry_delay = 0.25 })
+    assert(api:get("/").ok and sleeps[1] == 0.25)
+end
+
+local function retry_after_date_test()
+    local now = 784111777 -- Sun, 06 Nov 1994 08:49:37 GMT
+    local api, _, sleeps = client_with({ { 503, "", { ["retry-after"] = "Sun, 06 Nov 1994 08:49:47 GMT" } }, OK }, {
+        base = "https://a.example", now = function() return now end,
+    })
+    assert(api:get("/").ok)
+    assert(sleeps[1] == 10, sleeps[1])
+    -- A date in the past retries at once.
+    api, _, sleeps = client_with({ { 503, "", { ["retry-after"] = "Sat, 01 Jan 2000 00:00:00 GMT" } }, OK }, {
+        base = "https://a.example", now = function() return 946684800 + 5 end,
+    })
+    assert(api:get("/").ok and sleeps[1] == 0)
+    api, _, sleeps = client_with({ { 503, "", { ["retry-after"] = "Thu, 29 Feb 2024 12:00:00 GMT" } }, OK }, {
+        base = "https://a.example", now = function() return 1709208000 - 3 end,
+    })
+    assert(api:get("/").ok and sleeps[1] == 3, sleeps[1])
+end
+
+-- Redirects --------------------------------------------------------------------
+
+local function redirect_test()
+    local api, calls = client_with({
+        { 302, "", { location = "/b" } },
+        { 301, "", { location = "c?x=1" } },
+        { 307, "", { location = "https://other.example/d" } },
+        OK,
+    }, { base = "https://a.example", headers = { authorization = "Bearer t", ["x-keep"] = "1" } })
+    local res = api:get("/dir/a")
+    assert(res.ok and res.url == "https://other.example/d" and res.attempts == 1)
+    assert(calls[2].url == "https://a.example/b")
+    assert(calls[3].url == "https://a.example/c?x=1")
+    assert(calls[3].headers.authorization == "Bearer t")
+    assert(calls[4].url == "https://other.example/d")
+    assert(calls[4].headers.authorization == nil and calls[4].headers["x-keep"] == "1")
+end
+
+local function redirect_method_test()
+    local api, calls = client_with({ { 303, "", { location = "/done" } }, OK }, { base = "https://a.example" })
+    api:post("/submit", { json = { a = 1 } })
+    assert(calls[2].method == "GET" and calls[2].body == nil and calls[2].headers["content-type"] == nil)
+    api, calls = client_with({ { 308, "", { location = "/moved" } }, OK }, { base = "https://a.example" })
+    api:post("/submit", { json = { a = 1 } })
+    assert(calls[2].method == "POST" and calls[2].body == '{"a":1}')
+    assert(calls[2].headers["content-type"] == "application/json")
+    api, calls = client_with({ { 302, "", { location = "//cdn.example/x" } }, OK }, { base = "https://a.example" })
+    api:post("/submit", { body = "x" })
+    assert(calls[2].method == "GET" and calls[2].url == "https://cdn.example/x")
+end
+
+local function redirect_limit_test()
+    local api, calls = client_with({ { 302, "", { location = "/loop" } } }, { base = "https://a.example", max_redirects = 3 })
+    local res = api:get("/loop")
+    assert(res.status == 302 and res.ok == false and res.headers.location == "/loop")
+    assert(#calls == 4)
+    api, calls = client_with({ { 301, "", { location = "/b" } }, OK }, { base = "https://a.example", max_redirects = 0 })
+    assert(api:get("/a").status == 301 and #calls == 1)
+    api, calls = client_with({ { 301, "", { location = "/b" } }, OK }, { base = "https://a.example" })
+    assert(api:get("/a", { max_redirects = 0 }).status == 301 and #calls == 1)
+end
+
+-- Hooks and derived clients ----------------------------------------------------
+
+local function before_request_test()
+    local order = {}
+    local api, calls = client_with({ { 503 }, OK }, {
+        base = "https://a.example",
+        before_request = {
+            function(req)
+                order[#order + 1] = "first"
+                req.headers["x-signature"] = `$(req.method):$(req.url)`
+            end,
+            function(req)
+                order[#order + 1] = "second"
+                req.url = req.url .. "?signed=1"
+            end,
+        },
+    })
+    api:get("/data")
+    -- The hooks run once, and each attempt sends what they left.
+    assert(table.concat(order, " ") == "first second")
+    assert(#calls == 2)
+    assert(calls[2].url == "https://a.example/data?signed=1")
+    assert(calls[2].headers["x-signature"] == "GET:https://a.example/data")
+end
+
+local function after_response_test()
+    local seen
+    local api = client_with({ { 404, { error = "gone" } } }, {
+        base = "https://a.example",
+        after_response = function(response, req)
+            seen = `$(req.method) $(response.status)`
+            response.status = 200
+            response.ok = true
+        end,
+    })
+    local res = api:get("/x")
+    assert(seen == "GET 404" and res.ok and res:json().error == "gone")
+
+    api = client_with({ OK }, {
+        base = "https://a.example",
+        after_response = function(response) return { status = 500, original = response } end,
+    })
+    local err = error_of(api.get, api, "/x")
+    assert(err.status == 500 and err.response.original.status == 200)
+end
+
+local function extend_test()
+    local trail = {}
+    local api, calls = client_with({ OK }, {
+        base = "https://a.example", headers = { a = "1", b = "2" }, query = { v = 1 }, retries = 4,
+        before_request = function() trail[#trail + 1] = "parent" end,
+    })
+    local child = api:extend({
+        base = "https://a.example/v2", headers = { B = "3", c = "4", a = false }, query = { w = 2 },
+        before_request = function() trail[#trail + 1] = "child" end,
+        throw_http_errors = false,
+    })
+    child:get("/x")
+    assert(calls[1].url == "https://a.example/v2/x?v=1&w=2", calls[1].url)
+    assert(calls[1].headers.a == nil and calls[1].headers.b == "3" and calls[1].headers.c == "4")
+    assert(table.concat(trail, " ") == "parent child")
+    assert(child.retries == 4 and child.throw_http_errors == false)
+    -- The parent keeps its own options.
+    api:get("/y")
+    assert(calls[2].url == "https://a.example/y?v=1" and calls[2].headers.a == "1")
+    assert(#trail == 3 and api.throw_http_errors == true)
+end
+
+-- A real round trip ------------------------------------------------------------
+
+local function round_trip_test()
+    local ok, server = catch (function()
+        pledge("network")
+        return network.tcp.bind("127.0.0.1", 0)
+    end)()
+    if not ok then
+        skip("cannot bind a local port: " .. tostring(server))
+    end
+    local _, port = server:getsockname()
+    local hits = 0
+    local serving = coroutine.detach(coroutine.create(network.serve), server, function(req)
+        hits = hits + 1
+        if req.path == "/flaky" and hits == 1 then
+            return 503, "busy", { ["Retry-After"] = "0" }
+        elseif req.path == "/old" then
+            return 302, "", { Location = "/echo?moved=1" }
+        elseif req.path == "/missing" then
+            return 404, tojson({ error = "nothing here" }), { ["Content-Type"] = "application/json" }
+        elseif req.path == "/upload" then
+            local parts = form.multipart(req.body, req.headers["content-type"])
+            local file = parts.files[1]
+            return 200, tojson({ title = parts.fields.title, size = file.size, last = vector.get(file.data, file.size - 1) })
+        end
+        return 200, tojson({
+            method = req.method, path = req.path, query = req.query,
+            token = req.headers["x-token"], ctype = req.headers["content-type"],
+            body = vector.tostring(req.body),
+        }), { ["Content-Type"] = "application/json" }
+    end)
+    local api = http_client.new({ base = `http://127.0.0.1:$port`, headers = { ["X-Token"] = "t1" }, retry_delay = 0 })
+
+    local echo = api:get("/echo", { query = { q = "a b" } }):json()
+    assert(echo.method == "GET" and echo.path == "/echo" and echo.query == "q=a%20b" and echo.token == "t1")
+
+    echo = api:post("/echo", { json = { name = "Ada" } }):json()
+    assert(echo.method == "POST" and echo.ctype == "application/json" and fromjson(echo.body).name == "Ada")
+
+    echo = api:put("/echo", { form = { tags = { "a", "b" } } }):json()
+    assert(echo.body == "tags[]=a&tags[]=b")
+
+    local data = vector.create(2048)
+    for i = 0, 2047 do
+        vector.set(data, i, i % 256)
+    end
+    local up = api:post("/upload", { multipart = { title = "bin", file = { filename = "d.bin", data = data } } }):json()
+    assert(up.title == "bin" and up.size == 2048 and up.last == 255)
+
+    hits = 0
+    local res = api:get("/flaky")
+    assert(res.ok and res.attempts == 2)
+
+    res = api:get("/old")
+    assert(res.url == `http://127.0.0.1:$port/echo?moved=1` and res:json().query == "moved=1")
+
+    local err = error_of(api.get, api, "/missing")
+    assert(err.status == 404 and err.response:json().error == "nothing here")
+
+    coroutine.close(serving)
+    server:close()
+
+    -- With the server gone, the transport error surfaces after the retries.
+    err = error_of(api.get, api, "/echo", { retries = 1 })
+    assert(err.code == "network" and err.attempts == 2)
+end
+
+local function module_functions_test()
+    -- The module functions use network.fetch, which raises for a URL with
+    -- another scheme before it sends anything.
+    local err = error_of(http_client.get, "ftp://example.invalid/x", { retries = 0 })
+    assert(err.code == "network" and err.cause ~= nil and err.request.url == "ftp://example.invalid/x")
+    err = error_of(http_client.post, "ftp://example.invalid/x", { json = {} })
+    assert(err.code == "network" and err.request.method == "POST")
+    err = error_of(http_client.request, "delete", "ftp://example.invalid/x", { retries = 0 })
+    assert(err.request.method == "DELETE")
+end

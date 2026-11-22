@@ -1,0 +1,563 @@
+--- Sends HTTP requests with a base URL, encoded bodies, retries, and hooks.
+---
+--- A client wraps `network.fetch`. It joins each path to a base URL, adds
+--- default headers and a query table, and encodes a JSON, URL-encoded, or
+--- multipart body. It retries a request that failed in transit or that the
+--- server asked to repeat, with exponential backoff, and it follows
+--- redirects. A response is a table with `status`, `headers`, `body` as a
+--- vector, `ok`, and the methods `text` and `json`. A status of 400 or more
+--- raises an error object that carries the response.
+---
+--- ```lus nocheck
+--- local http_client = require("https://atmosp.here/2.0/http_client.lus")
+--- local api = http_client.new({ base = "https://api.example.com", headers = { authorization = `Bearer $(token)` } })
+--- local user = api:get("/users/42", { query = { fields = "name" } }):json()
+--- local created = api:post("/users", { json = { name = "Ada" } })
+--- ```
+---
+--- @package http_client
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-http-client
+--- @permission network:http Sends each request with `network.fetch`.
+
+local form = require("https://atmosp.here/2.0/form.lus")
+
+local M = {}
+
+local tojson, fromjson = tojson, fromjson
+local type, tostring, pairs, ipairs = type, tostring, pairs, ipairs
+
+-- Errors ----------------------------------------------------------------------
+
+local ClientError = {}
+ClientError.__index = ClientError
+ClientError.__tostring = function(err)
+    return "http_client: " .. err.message
+end
+
+--- Returns true if `value` is an error object that this package raised.
+---
+--- Such an error has a `message`, a `code`, and the `request` that failed.
+--- The code `"http"` marks a response with a status of 400 or more. The
+--- error then holds the `status` and the `response`, whose `json` and
+--- `text` methods read the body. The code `"network"` marks a request that
+--- got no response, and the error holds the transport error in `cause`.
+--- @param value any The value to test.
+--- @return boolean
+function M.is_error(value)
+    return getmetatable(value) == ClientError
+end
+
+-- Responses -------------------------------------------------------------------
+
+local Response = {}
+Response.__index = Response
+
+--- Returns the body of the response as a string.
+---
+--- The body is decoded as UTF-8, and a byte sequence that is not UTF-8
+--- becomes U+FFFD.
+--- @return string
+function Response:text()
+    local body = self.body
+    return vector.tostring(body, 0, #body, "lossy")
+end
+
+--- Decodes the body of the response as JSON.
+---
+--- A body that is not JSON raises the error of `fromjson`.
+--- @return any
+function Response:json()
+    return fromjson(self:text())
+end
+
+-- URLs ------------------------------------------------------------------------
+
+local function is_absolute(url)
+    return url:find("^%a[%w+.%-]*://") ~= nil
+end
+
+local function join_url(base, url)
+    if is_absolute(url) then
+        return url
+    end
+    if base == nil then
+        error(`http_client: the relative URL '$url' needs a base`, 3)
+    end
+    if url == "" then
+        return base
+    end
+    local b = base:sub(-1) == "/" and base:sub(1, -2) or base
+    if url:sub(1, 1) == "/" or url:sub(1, 1) == "?" then
+        return b .. url
+    end
+    return b .. "/" .. url
+end
+
+local function add_query(url, query)
+    local text = form.encode(query)
+    if text == "" then
+        return url
+    end
+    return url .. (url:find("?", 1, true) and "&" or "?") .. text
+end
+
+local function origin_of(url)
+    return url:match("^(%a[%w+.%-]*://[^/?#]*)")
+end
+
+-- Resolves the `Location` of a redirect against the URL that answered.
+local function resolve(url, location)
+    if is_absolute(location) then
+        return location
+    end
+    local origin = origin_of(url)
+    if location:sub(1, 2) == "//" then
+        return origin:match("^(%a[%w+.%-]*:)") .. location
+    end
+    if location:sub(1, 1) == "/" then
+        return origin .. location
+    end
+    local path = url:sub(#origin + 1):match("^[^?#]*")
+    local dir = path:match("^(.*/)") or "/"
+    return origin .. dir .. location
+end
+
+-- Retries ---------------------------------------------------------------------
+
+local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6, Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+
+-- Returns the seconds that a Retry-After header asks for, from a count of
+-- seconds or from an HTTP date.
+local function retry_after(value, now)
+    if value == nil then
+        return nil
+    end
+    if seconds = tonumber(value) then
+        return seconds >= 0 and seconds or nil
+    end
+    local day, month, year, hour, min, sec = value:match("(%d+) (%a+) (%d+) (%d+):(%d+):(%d+)")
+    month = MONTHS[month]
+    if month == nil then
+        return nil
+    end
+    -- Days from 1970-01-01 in the proleptic Gregorian calendar.
+    local y, m, d = tonumber(year), month, tonumber(day)
+    if m <= 2 then
+        y = y - 1
+    end
+    local era = y // 400
+    local yoe = y - era * 400
+    local doy = (153 * (m > 2 and m - 3 or m + 9) + 2) // 5 + d - 1
+    local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    local days = era * 146097 + doe - 719468
+    local at = days * 86400 + tonumber(hour) * 3600 + tonumber(min) * 60 + tonumber(sec)
+    local wait = at - now()
+    return wait > 0 and wait or 0
+end
+
+-- The standard library has no sleep, so the default waits on the monotonic
+-- clock. A program with a scheduler passes its own `sleep`.
+local function default_sleep(seconds)
+    local start = time.monotonic()
+    while (time.monotonic() - start):seconds() < seconds do
+    end
+end
+
+local function to_set(list, upper)
+    local set = {}
+    for _, item in ipairs(list) do
+        set[upper and item:upper() or item] = true
+    end
+    return set
+end
+
+local RETRY_METHODS = { "GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE" }
+local RETRY_STATUSES = { 408, 429, 500, 502, 503, 504 }
+local REDIRECTS = { [301] = true, [302] = true, [303] = true, [307] = true, [308] = true }
+
+-- Clients ---------------------------------------------------------------------
+
+local Client = {}
+Client.__index = Client
+
+local function to_list(value)
+    if value == nil then
+        return {}
+    end
+    if type(value) == "function" then
+        return { value }
+    end
+    return value
+end
+
+local function merge_headers(into, headers)
+    if headers then
+        for name, value in pairs(headers) do
+            if value == false then
+                into[name:lower()] = nil
+            else
+                into[name:lower()] = value
+            end
+        end
+    end
+    return into
+end
+
+local function merge(base, extra)
+    local out = {}
+    if base then
+        for k, v in pairs(base) do
+            out[k] = v
+        end
+    end
+    if extra then
+        for k, v in pairs(extra) do
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function append(first, second)
+    local out = {}
+    for i, item in ipairs(first) do
+        out[i] = item
+    end
+    for _, item in ipairs(second) do
+        out[#out + 1] = item
+    end
+    return out
+end
+
+local function option(request_options, config, name)
+    local value = request_options[name]
+    if value == nil then
+        return config[name]
+    end
+    return value
+end
+
+--- Creates a client.
+---
+--- Every option has a default, and `options` itself may be omitted.
+---
+--- - `base`: the URL that relative request URLs are joined to.
+--- - `headers`: headers for every request. Names are case-insensitive.
+--- - `query`: a table of query parameters for every request.
+--- - `throw_http_errors`: `true` (the default) to raise an error object for
+---   a status of 400 or more. With `false`, such a response is returned.
+--- - `retries`: how many times a request is sent again, 2 by default.
+--- - `retry_delay`: the wait before the first retry in seconds, 0.3 by
+---   default. Each further retry doubles it.
+--- - `max_retry_delay`: the longest wait in seconds, 30 by default. A
+---   `Retry-After` that asks for more ends the retries.
+--- - `jitter`: `true` (the default) to wait a random time between half of
+---   the delay and the whole delay.
+--- - `retry_methods`: the methods that are retried, by default the
+---   idempotent ones: `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`.
+--- - `retry_statuses`: the statuses that are retried, by default 408, 429,
+---   500, 502, 503, and 504.
+--- - `max_redirects`: how many redirects a request follows, 5 by default.
+---   With 0, a 3xx response is returned as it is.
+--- - `before_request`: a function or a list of functions `hook(request)`.
+---   Each runs once before the request is sent and may change the fields
+---   `method`, `url`, `headers`, and `body` of the request table.
+--- - `after_response`: a function or a list of functions
+---   `hook(response, request)`. Each runs on the final response, before the
+---   status is checked. A hook that returns a value replaces the response.
+--- - `fetch`: the transport, a function with the signature and the results
+---   of `network.fetch`, which is the default. Tests pass a stub here.
+--- - `sleep`: a function `sleep(seconds)` that waits between retries. The
+---   default waits on the monotonic clock and keeps the processor busy, so
+---   a program with a scheduler passes a function that suspends.
+--- @param options table? The options.
+--- @return table The client.
+function M.new(options)
+    options = options or {}
+    local self = setmetatable({}, Client)
+    self.base = options.base
+    self.headers = merge_headers({}, options.headers)
+    self.query = options.query
+    self.throw_http_errors = options.throw_http_errors ~= false
+    self.retries = options.retries or 2
+    self.retry_delay = options.retry_delay or 0.3
+    self.max_retry_delay = options.max_retry_delay or 30
+    self.jitter = options.jitter ~= false
+    self.retry_methods = options.retry_methods or RETRY_METHODS
+    self.retry_statuses = options.retry_statuses or RETRY_STATUSES
+    self.max_redirects = options.max_redirects or 5
+    self.before_request = to_list(options.before_request)
+    self.after_response = to_list(options.after_response)
+    self.fetch = options.fetch or network.fetch
+    self.sleep = options.sleep or default_sleep
+    self.now = options.now or os.time
+    self.method_set = to_set(self.retry_methods, true)
+    self.status_set = to_set(self.retry_statuses, false)
+    return self
+end
+
+--- Creates a client that inherits the options of this one.
+---
+--- `options` takes the options of `http_client.new`. A value replaces the
+--- inherited one, except that `headers` and `query` are merged with the
+--- inherited tables and hooks are added after the inherited hooks. A header
+--- set to `false` removes the inherited header.
+--- @param options table The options that differ.
+--- @return table The new client.
+function Client:extend(options)
+    local merged = {}
+    for _, name in ipairs({
+        "base", "throw_http_errors", "retries", "retry_delay", "max_retry_delay", "jitter",
+        "retry_methods", "retry_statuses", "max_redirects", "fetch", "sleep", "now",
+    }) do
+        merged[name] = option(options, self, name)
+    end
+    merged.headers = merge_headers(merge(self.headers), options.headers)
+    merged.query = (self.query or options.query) and merge(self.query, options.query) or nil
+    merged.before_request = append(self.before_request, to_list(options.before_request))
+    merged.after_response = append(self.after_response, to_list(options.after_response))
+    return M.new(merged)
+end
+
+local function backoff(self, attempts)
+    local delay = math.min(self.retry_delay * 2 ^ (attempts - 1), self.max_retry_delay)
+    if self.jitter then
+        delay = delay * (0.5 + 0.5 * math.random())
+    end
+    return delay
+end
+
+local function fail(code, message, fields)
+    fields.code = code
+    fields.message = message
+    error(setmetatable(fields, ClientError), 0)
+end
+
+--- Sends a request and returns the response.
+---
+--- `url` is absolute, or relative to the `base` of the client. The options
+--- are the following, and at most one of `json`, `form`, `multipart`, and
+--- `body` sets the body.
+---
+--- - `headers`: headers for this request, which win over the headers of
+---   the client. A header set to `false` is left out.
+--- - `query`: a table of query parameters, encoded with `form.encode`, so a
+---   nested table becomes `a[b]=1` and a list becomes `a[]=1&a[]=2`.
+--- - `json`: a value that is sent as JSON with the content type
+---   `application/json`.
+--- - `form`: a table that is sent URL-encoded with the content type
+---   `application/x-www-form-urlencoded`.
+--- - `multipart`: a table of fields and files that is sent as
+---   `multipart/form-data`, in the format of `form.encode_multipart`.
+--- - `body`: a string or a vector that is sent as it is.
+--- - `retries`, `throw_http_errors`, `max_redirects`: values for this
+---   request in place of those of the client.
+---
+--- The response is a table with `status`, `headers` (lowercase names),
+--- `body` (a vector), `ok` (true for a 2xx status), `url` (the URL that
+--- answered, after redirects), `method`, and `attempts` (how many times
+--- the request was sent). Its methods are `text()` and `json()`.
+---
+--- A request is sent again when its method is one of `retry_methods` and
+--- either the transport raised an error or the status is one of
+--- `retry_statuses`. The wait doubles with each retry. A `Retry-After`
+--- header, in seconds or as a date, sets the wait in its place.
+---
+--- A redirect with the status 301, 302, or 303 is followed with `GET` and
+--- without the body, unless the method is `GET` or `HEAD`. A 307 or a 308
+--- keeps the method and the body. A redirect to another origin drops the
+--- `authorization` and `cookie` headers.
+---
+--- A status of 400 or more raises an error object with the code `"http"`
+--- unless `throw_http_errors` is false. A transport error that outlasts the
+--- retries raises an error object with the code `"network"`. See
+--- `http_client.is_error`.
+--- @param method string The method, in any case.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:request(method, url, options)
+    options = options or {}
+    method = method:upper()
+    url = join_url(self.base, url)
+    if self.query then
+        url = add_query(url, self.query)
+    end
+    if options.query then
+        url = add_query(url, options.query)
+    end
+
+    local headers = merge(self.headers)
+    local body = options.body
+    if options.json ~= nil then
+        body = tojson(options.json)
+        headers["content-type"] = "application/json"
+    elseif options.form ~= nil then
+        body = form.encode(options.form)
+        headers["content-type"] = "application/x-www-form-urlencoded"
+    elseif options.multipart ~= nil then
+        body, headers["content-type"] = form.encode_multipart(options.multipart)
+    end
+    merge_headers(headers, options.headers)
+
+    local request = { method = method, url = url, headers = headers, body = body }
+    for _, hook in ipairs(self.before_request) do
+        hook(request)
+    end
+
+    local fetch, sleep from self
+    local retries = option(options, self, "retries")
+    local redirects = option(options, self, "max_redirects")
+    local max_delay = self.max_retry_delay
+    local attempts = 0
+    local status, response_body, response_headers
+    while true do
+        attempts = attempts + 1
+        local ok
+        ok, status, response_body, response_headers = catch fetch(request.url, request.method, request.headers, request.body)
+        local may_retry = attempts <= retries and self.method_set[request.method]
+        if not ok then
+            if not may_retry then
+                fail("network", `$(request.method) $(request.url): $(tostring(status))`,
+                    { cause = status, request = request, attempts = attempts })
+            end
+            sleep(backoff(self, attempts))
+            continue
+        end
+        response_headers = response_headers or {}
+        if may_retry and self.status_set[status] then
+            local asked = retry_after(response_headers["retry-after"], self.now)
+            if asked == nil then
+                sleep(backoff(self, attempts))
+                continue
+            elseif asked <= max_delay then
+                sleep(asked)
+                continue
+            end
+        elseif REDIRECTS[status] and redirects > 0 and response_headers.location then
+            redirects = redirects - 1
+            local target = resolve(request.url, response_headers.location)
+            if origin_of(target) ~= origin_of(request.url) then
+                request.headers.authorization = nil
+                request.headers.cookie = nil
+            end
+            request.url = target
+            local m = request.method
+            if status == 303 and m ~= "HEAD" or (status == 301 or status == 302) and m ~= "GET" and m ~= "HEAD" then
+                request.method = "GET"
+                request.body = nil
+                request.headers["content-type"] = nil
+            end
+            attempts = attempts - 1
+            continue
+        end
+        break
+    end
+
+    local response = setmetatable({
+        status = status,
+        headers = response_headers,
+        body = response_body or vector.create(0),
+        ok = status >= 200 and status < 300,
+        url = request.url,
+        method = request.method,
+        attempts = attempts,
+    }, Response)
+    for _, hook in ipairs(self.after_response) do
+        local replaced = hook(response, request)
+        if replaced ~= nil then
+            response = replaced
+        end
+    end
+    if response.status >= 400 and option(options, self, "throw_http_errors") then
+        fail("http", `$(request.method) $(request.url): status $(response.status)`,
+            { status = response.status, response = response, request = request, attempts = attempts })
+    end
+    return response
+end
+
+--- Sends a `GET` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:get(url, options)
+    return self:request("GET", url, options)
+end
+
+--- Sends a `HEAD` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:head(url, options)
+    return self:request("HEAD", url, options)
+end
+
+--- Sends a `POST` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:post(url, options)
+    return self:request("POST", url, options)
+end
+
+--- Sends a `PUT` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:put(url, options)
+    return self:request("PUT", url, options)
+end
+
+--- Sends a `PATCH` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:patch(url, options)
+    return self:request("PATCH", url, options)
+end
+
+--- Sends a `DELETE` request. See `request` for the options and the results.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function Client:delete(url, options)
+    return self:request("DELETE", url, options)
+end
+
+-- Module functions ------------------------------------------------------------
+
+local shared
+
+--- Sends a request with a client that has the default options.
+---
+--- The options and the results are those of the `request` method of a
+--- client, and `url` is absolute.
+--- @param method string The method.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function M.request(method, url, options)
+    shared = shared or M.new()
+    return shared:request(method, url, options)
+end
+
+--- Sends a `GET` request with the default options. See `http_client.request`.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function M.get(url, options)
+    return M.request("GET", url, options)
+end
+
+--- Sends a `POST` request with the default options. See `http_client.request`.
+--- @param url string The URL.
+--- @param options table? The options.
+--- @return table The response.
+function M.post(url, options)
+    return M.request("POST", url, options)
+end
+
+return M
