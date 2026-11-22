@@ -1,8 +1,7 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
-pledge("load", "fs:read=" .. PACKAGES .. "/*")
-package.path = ROOT .. "/?.lus;"
-    .. PACKAGES .. "/form/?.lus;" .. PACKAGES .. "/atmos-form/?.lus;" .. package.path
+pledge("load", `fs:read=$PACKAGES/*`)
+package.path = `$ROOT/?.lus;$PACKAGES/form/?.lus;$PACKAGES/atmos-form/?.lus;$(package.path)`
 -- The package requires form by its atmosphere URL. The tests load the
 -- checkout next to this one in its place.
 package.preload["https://atmosp.here/2.0/form.lus"] = function() return require("form") end

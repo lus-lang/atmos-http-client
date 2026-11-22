@@ -1,12 +1,13 @@
 --- Sends HTTP requests with a base URL, encoded bodies, retries, and hooks.
 ---
---- A client wraps `network.fetch`. It joins each path to a base URL, adds
---- default headers and a query table, and encodes a JSON, URL-encoded, or
---- multipart body. It retries a request that failed in transit or that the
---- server asked to repeat, with exponential backoff, and it follows
---- redirects. A response is a table with `status`, `headers`, `body` as a
---- vector, `ok`, and the methods `text` and `json`. A status of 400 or more
---- raises an error object that carries the response.
+--- A client sends requests with `network.fetch`. It joins each path to a
+--- base URL, adds default headers and a query table, and encodes a JSON,
+--- URL-encoded, or multipart body. It retries a request that failed in
+--- transit or that received a status such as 503, with exponential backoff
+--- between the attempts. It also follows redirects. A response is a table
+--- with `status`, `headers`, `body` as a vector, `ok`, and the methods
+--- `text` and `json`. A status of 400 or more raises an error object that
+--- includes the response.
 ---
 --- ```lus nocheck
 --- local http_client = require("https://atmosp.here/2.0/http_client.lus")
@@ -16,7 +17,7 @@
 --- ```
 ---
 --- @package http_client
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-http-client
@@ -40,10 +41,11 @@ end
 --- Returns true if `value` is an error object that this package raised.
 ---
 --- Such an error has a `message`, a `code`, and the `request` that failed.
---- The code `"http"` marks a response with a status of 400 or more. The
---- error then holds the `status` and the `response`, whose `json` and
---- `text` methods read the body. The code `"network"` marks a request that
---- got no response, and the error holds the transport error in `cause`.
+--- The code `"http"` means that the response has a status of 400 or more.
+--- Such an error also has the `status` and the `response`, whose `json`
+--- and `text` methods read the body. The code `"network"` means that the
+--- request got no response. Such an error has the transport error in
+--- `cause`.
 --- @param value any The value to test.
 --- @return boolean
 function M.is_error(value)
@@ -57,8 +59,8 @@ Response.__index = Response
 
 --- Returns the body of the response as a string.
 ---
---- The body is decoded as UTF-8, and a byte sequence that is not UTF-8
---- becomes U+FFFD.
+--- The body is decoded as UTF-8. A byte sequence that is not UTF-8 becomes
+--- U+FFFD.
 --- @return string
 function Response:text()
     local body = self.body
@@ -93,7 +95,7 @@ local function join_url(base, url)
     if url:sub(1, 1) == "/" or url:sub(1, 1) == "?" then
         return b .. url
     end
-    return b .. "/" .. url
+    return `$b/$url`
 end
 
 local function add_query(url, query)
@@ -242,7 +244,7 @@ end
 
 --- Creates a client.
 ---
---- Every option has a default, and `options` itself may be omitted.
+--- Every option has a default, so `options` may be omitted.
 ---
 --- - `base`: the URL that relative request URLs are joined to.
 --- - `headers`: headers for every request. Names are case-insensitive.
@@ -253,7 +255,7 @@ end
 --- - `retry_delay`: the wait before the first retry in seconds, 0.3 by
 ---   default. Each further retry doubles it.
 --- - `max_retry_delay`: the longest wait in seconds, 30 by default. A
----   `Retry-After` that asks for more ends the retries.
+---   `Retry-After` longer than this ends the retries.
 --- - `jitter`: `true` (the default) to wait a random time between half of
 ---   the delay and the whole delay.
 --- - `retry_methods`: the methods that are retried, by default the
@@ -338,12 +340,12 @@ end
 
 --- Sends a request and returns the response.
 ---
---- `url` is absolute, or relative to the `base` of the client. The options
---- are the following, and at most one of `json`, `form`, `multipart`, and
---- `body` sets the body.
+--- `url` is absolute, or relative to the `base` of the client. The request
+--- takes the following options. At most one of `json`, `form`,
+--- `multipart`, and `body` sets the body.
 ---
---- - `headers`: headers for this request, which win over the headers of
----   the client. A header set to `false` is left out.
+--- - `headers`: headers for this request, which replace the headers of the
+---   client with the same names. A header set to `false` is left out.
 --- - `query`: a table of query parameters, encoded with `form.encode`, so a
 ---   nested table becomes `a[b]=1` and a list becomes `a[]=1&a[]=2`.
 --- - `json`: a value that is sent as JSON with the content type
@@ -372,8 +374,8 @@ end
 --- `authorization` and `cookie` headers.
 ---
 --- A status of 400 or more raises an error object with the code `"http"`
---- unless `throw_http_errors` is false. A transport error that outlasts the
---- retries raises an error object with the code `"network"`. See
+--- unless `throw_http_errors` is false. A transport error that remains after
+--- the last retry raises an error object with the code `"network"`. See
 --- `http_client.is_error`.
 --- @param method string The method, in any case.
 --- @param url string The URL.
@@ -534,7 +536,7 @@ local shared
 --- Sends a request with a client that has the default options.
 ---
 --- The options and the results are those of the `request` method of a
---- client, and `url` is absolute.
+--- client. `url` must be absolute.
 --- @param method string The method.
 --- @param url string The URL.
 --- @param options table? The options.
