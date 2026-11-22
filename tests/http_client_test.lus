@@ -631,12 +631,10 @@ end
 -- A real round trip ------------------------------------------------------------
 
 local function round_trip_test()
-    local ok, server = catch (function()
-        pledge("network")
-        return network.tcp.bind("127.0.0.1", 0)
-    end)()
-    if not ok then
-        skip("cannot bind a local port: " .. tostring(server))
+    pledge("network")
+    local server, bind_err = network.tcp.bind("127.0.0.1", 0)
+    if not server then
+        skip("cannot bind a local port: " .. tostring(bind_err))
     end
     local _, port = server:getsockname()
     local hits = 0
@@ -709,12 +707,10 @@ end
 -- Streams over a socket ----------------------------------------------------------
 
 local function bind()
-    local ok, server = catch (function()
-        pledge("network")
-        return network.tcp.bind("127.0.0.1", 0)
-    end)()
-    if not ok then
-        skip("cannot bind a local port: " .. tostring(server))
+    pledge("network")
+    local server, bind_err = network.tcp.bind("127.0.0.1", 0)
+    if not server then
+        skip("cannot bind a local port: " .. tostring(bind_err))
     end
     local _, port = server:getsockname()
     return server, port

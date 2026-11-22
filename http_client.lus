@@ -47,8 +47,9 @@ end
 --- and `text` methods read the body. The code `"network"` means that the
 --- request got no response, or that the body of a streamed response
 --- failed while it was read. Such an error has the transport error in
---- `cause`. Its `timeout` is true when a step of the request ran out of
---- time.
+--- `cause`, which for `network.fetch` is an error object with a `code` such
+--- as `"refused"` or `"timeout"` and a `message`. Its `timeout` is true when
+--- a step of the request ran out of time.
 --- @param value any The value to test.
 --- @return boolean
 function M.is_error(value)
@@ -85,8 +86,14 @@ function Response:json()
     return fromjson(self:text())
 end
 
+-- `network.fetch` raises an error object whose code is "timeout". A
+-- transport of the `fetch` option may raise the message alone.
 local function is_timeout(cause)
-    return type(cause) == "string" and cause:find("fetch timeout", 1, true) ~= nil
+    local kind = type(cause)
+    if kind == "table" then
+        return rawget(cause, "code") == "timeout"
+    end
+    return kind == "string" and cause:find("fetch timeout", 1, true) ~= nil
 end
 
 local Closer = {}
@@ -190,9 +197,9 @@ function Response:lines(max_bytes)
             coroutine.yield(part)
         end
     end)
-    local step, state = network.lines(parts, max_bytes)
+    local next_line = network.lines(parts, max_bytes)
     return function()
-        local ok, line = catch step(state)
+        local ok, line = catch next_line()
         if not ok then
             response:close()
             -- The error object of the stream comes out as it was raised.
